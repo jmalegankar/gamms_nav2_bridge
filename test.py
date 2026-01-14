@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 
-import rclpy
-from rclpy.node import Node
-from nav2_simple_commander.robot_navigator import BasicNavigator
-from geometry_msgs.msg import PoseStamped
-from sensor_msgs.msg import NavSatFix
-from robot_localization.srv import FromLL
 import osmnx as ox
 import networkx as nx
 import math
 import argparse
+
+# ROS2 imports - only loaded when needed (not in test mode)
+# import rclpy
+# from rclpy.node import Node
+# from nav2_simple_commander.robot_navigator import BasicNavigator
+# from geometry_msgs.msg import PoseStamped
+# from sensor_msgs.msg import NavSatFix
+# from robot_localization.srv import FromLL
 
 
 def parse_osm_with_osmnx(file_path):
@@ -23,12 +25,13 @@ def parse_osm_with_osmnx(file_path):
     
     print(f"Graph loaded: {len(G.nodes)} nodes, {len(G.edges)} edges")
     
+    # Extract node data (osmnx stores lat/lon as 'y'/'x' attributes)
     nodes = []
     for node_id, data in G.nodes(data=True):
         nodes.append({
             'id': str(node_id),
-            'lat': data['y'], 
-            'lon': data['x']
+            'lat': data['y'],  # osmnx stores latitude as 'y'
+            'lon': data['x']   # osmnx stores longitude as 'x'
         })
     
     print(f"Total nodes extracted: {len(nodes)}")
@@ -91,53 +94,80 @@ def find_nearest(nodes, current_lat, current_lon):
     return nearest
 
 
-class Navigator(Node):
+class Navigator:
+    """Navigator class - only used in full ROS2 mode"""
     def __init__(self):
-        super().__init__('osm_navigator')
+        # Import ROS2 modules here to avoid import errors in test mode
+        import rclpy
+        from rclpy.node import Node as ROS2Node
+        from nav2_simple_commander.robot_navigator import BasicNavigator
+        from sensor_msgs.msg import NavSatFix
+        from robot_localization.srv import FromLL
+        
+        # Create ROS2 node
+        class NavigatorNode(ROS2Node):
+            def __init__(inner_self):
+                super().__init__('osm_navigator')
+        
+        self.node = NavigatorNode()
         self.nav = BasicNavigator()
         self.gps = None
-        self.create_subscription(NavSatFix, '/gps/fix', lambda msg: setattr(self, 'gps', msg), 10)
-        self.ll_client = self.create_client(FromLL, '/fromLL')
+        
+        self.node.create_subscription(
+            NavSatFix, '/gps/fix', 
+            lambda msg: setattr(self, 'gps', msg), 10
+        )
+        self.ll_client = self.node.create_client(FromLL, '/fromLL')
         
         while not self.ll_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for /fromLL service...')
+            self.node.get_logger().info('Waiting for /fromLL service...')
     
     def wait_gps(self):
         """Wait for GPS fix"""
+        import rclpy
         while self.gps is None:
-            rclpy.spin_once(self, timeout_sec=0.1)
+            rclpy.spin_once(self.node, timeout_sec=0.1)
         return self.gps.latitude, self.gps.longitude
     
     def gps_to_pose(self, lat, lon):
         """Convert GPS to map coordinates"""
+        import rclpy
+        from robot_localization.srv import FromLL
+        from geometry_msgs.msg import PoseStamped
+        
         req = FromLL.Request()
         req.ll_point.latitude = lat
         req.ll_point.longitude = lon
         req.ll_point.altitude = 0.0
         
         future = self.ll_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future)
+        rclpy.spin_until_future_complete(self.node, future)
         
         pose = PoseStamped()
         pose.header.frame_id = 'map'
-        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.header.stamp = self.node.get_clock().now().to_msg()
         pose.pose.position = future.result().map_point
         pose.pose.orientation.w = 1.0
         return pose
     
     def go_to_node(self, node):
         """Navigate to OSM node"""
-        self.get_logger().info(f"Going to node {node['id']} at ({node['lat']}, {node['lon']})")
+        import rclpy
+        from nav2_simple_commander.robot_navigator import BasicNavigator
+        
+        self.node.get_logger().info(
+            f"Going to node {node['id']} at ({node['lat']}, {node['lon']})"
+        )
         
         goal = self.gps_to_pose(node['lat'], node['lon'])
         self.nav.goToPose(goal)
         
         while not self.nav.isTaskComplete():
-            rclpy.spin_once(self, timeout_sec=0.1)
+            rclpy.spin_once(self.node, timeout_sec=0.1)
         
         result = self.nav.getResult()
         success = result == BasicNavigator.TaskResult.SUCCEEDED
-        self.get_logger().info('Success!' if success else 'Failed')
+        self.node.get_logger().info('Success!' if success else 'Failed')
         return success
 
 
@@ -181,7 +211,15 @@ def main():
         print(f"  Edges: {len(graph.edges)}")
         return
     
-    # Full ROS2 navigation mode
+    # Full ROS2 navigation mode (only runs if not in test mode)
+    try:
+        import rclpy
+        from nav2_simple_commander.robot_navigator import BasicNavigator
+    except ImportError:
+        print("\nERROR: ROS2 packages not found!")
+        print("  Install ROS2 and required packages, or use --test-mode")
+        return
+    
     rclpy.init()
     navigator = Navigator()
     
