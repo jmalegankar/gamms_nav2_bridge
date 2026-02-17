@@ -18,15 +18,11 @@ import argparse
 import gamms
 import gamms.osm
 import strategy  # Your agent_strategy.py
+from pyproj import Transformer
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-
-ROBOT_NS = 'j100_0004'
-GPS_TOPIC = f'/{ROBOT_NS}/gps/filtered'
-FROMLL_SERVICE = f'/{ROBOT_NS}/fromLL'
-NAV2_ACTION = f'/{ROBOT_NS}/follow_waypoints'
 
 MAP_FRAME = 'map'
 NAV_TIMEOUT = 120.0  # seconds
@@ -41,12 +37,13 @@ NODE_TOLERANCE = 1.0  # meters
 class CoordConverter:
     """Convert between GAMMS UTM coords and Nav2 map frame."""
     
-    def __init__(self, node, origin_lat: float, origin_lon: float):
+    def __init__(self, node, origin_lat: float, origin_lon: float, fromll_service: str):
         self.node = node
         self.origin_lat = origin_lat
         self.origin_lon = origin_lon
-        
-        from pyproj import Transformer
+        self.fromll_service = fromll_service
+
+    
         utm_zone = int((origin_lon + 180) / 6) + 1
         self.wgs84_to_utm = Transformer.from_crs(
             'EPSG:4326', f'EPSG:326{utm_zone}', always_xy=True
@@ -61,12 +58,12 @@ class CoordConverter:
         
         # FromLL service client
         from robot_localization.srv import FromLL
-        self.fromll_client = node.create_client(FromLL, FROMLL_SERVICE)
+        self.fromll_client = node.create_client(FromLL, self.fromll_service)
         
     def wait_for_service(self, timeout=10.0):
-        print(f"[Coords] Waiting for {FROMLL_SERVICE}...")
+        print(f"[Coords] Waiting for {self.fromll_service}...")
         if not self.fromll_client.wait_for_service(timeout_sec=timeout):
-            raise RuntimeError(f"Service {FROMLL_SERVICE} not available")
+            raise RuntimeError(f"Service {self.fromll_service} not available")
         print(f"[Coords] Service ready")
         
     def gamms_to_gps(self, x: float, y: float) -> tuple:
@@ -118,7 +115,7 @@ class GAMMSNav2Bridge:
     """Bridge between GAMMS game loop and Nav2."""
     
     def __init__(self, osm_file: str, origin_lat: float, origin_lon: float, 
-                 test_mode: bool = False, start_node: int = None):
+                 test_mode: bool = False, start_node: int = None, namespace: str = ""):
         self.osm_file = osm_file
         self.origin_lat = origin_lat
         self.origin_lon = origin_lon
@@ -139,9 +136,25 @@ class GAMMSNav2Bridge:
         # Step counter
         self.step = 0
         
+        # Agent naming (strategy expects 'agent_0' format)
+        self.agent_name = 'agent_0'
+
+        self.namespace = namespace
+        pfx = self._ns_prefix(namespace)
+        
+        self.gps_topic = f"{pfx}/gps/filtered"
+        self.fromll_service = f"{pfx}/fromLL"
+        self.nav2_action = f"{pfx}/follow_waypoints"
+        
+        
+        
         print("\n" + "="*60)
         print("GAMMS-NAV2 BRIDGE" + (" [TEST MODE]" if test_mode else ""))
         print("="*60)
+    
+    def _ns_prefix(self, ns: str) -> str:
+            ns = (ns or "").strip().strip("/")
+            return f"/{ns}" if ns else ""
         
     def initialize(self):
         """Full initialization sequence."""
@@ -166,23 +179,23 @@ class GAMMSNav2Bridge:
         self.ros_node = Node('gamms_nav2_bridge')
         
         # Coordinate converter
-        self.coords = CoordConverter(self.ros_node, self.origin_lat, self.origin_lon)
+        self.coords = CoordConverter(self.ros_node, self.origin_lat, self.origin_lon, self.fromll_service)
         self.coords.wait_for_service()
         
         # Nav2 action client
-        self.nav_client = ActionClient(self.ros_node, FollowWaypoints, NAV2_ACTION)
-        print(f"[ROS2] Waiting for {NAV2_ACTION}...")
+        self.nav_client = ActionClient(self.ros_node, FollowWaypoints, self.nav2_action)
+        print(f"[ROS2] Waiting for {self.nav2_action}...")
         if not self.nav_client.wait_for_server(timeout_sec=30.0):
-            raise RuntimeError(f"Nav2 action {NAV2_ACTION} not available")
+            raise RuntimeError(f"Nav2 action {self.nav2_action} not available")
         print(f"[ROS2] Nav2 ready")
         
         # GPS subscriber
         self.gps_sub = self.ros_node.create_subscription(
-            NavSatFix, GPS_TOPIC, self._gps_callback, 10
+            NavSatFix, self.gps_topic, self._gps_callback, 10
         )
         
         # Wait for GPS
-        print(f"[ROS2] Waiting for GPS on {GPS_TOPIC}...")
+        print(f"[ROS2] Waiting for GPS on {self.gps_topic}...")
         while self.current_gps is None:
             rclpy.spin_once(self.ros_node, timeout_sec=0.1)
         print(f"[ROS2] GPS: {self.current_gps[0]:.6f}, {self.current_gps[1]:.6f}")
@@ -227,7 +240,6 @@ class GAMMSNav2Bridge:
         strategy.visited_nodes.clear()
         strategy.recent_nodes.clear()
         
-        from pyproj import Transformer
         utm_zone = int((self.origin_lon + 180) / 6) + 1
         wgs84_to_utm = Transformer.from_crs(
             'EPSG:4326', f'EPSG:326{utm_zone}', always_xy=True
@@ -259,7 +271,11 @@ class GAMMSNav2Bridge:
                 print(f"[Init] Using override start node: {self.start_node} at ({x:.1f}, {y:.1f})")
                 return
             else:
-                print(f"[Init] Warning: Override node {self.start_node_override} not found, using GPS/random")
+                # Show some valid node IDs to help user
+                sample_nodes = list(strategy.global_nodes.keys())[:10]
+                print(f"[Init] Warning: Node {self.start_node_override} not found!")
+                print(f"[Init] Available nodes (sample): {sample_nodes}")
+                print(f"[Init] Falling back to GPS/random...")
         
         # Test mode: pick random node
         if self.test_mode:
@@ -270,7 +286,6 @@ class GAMMSNav2Bridge:
             return
         
         # Full mode: use GPS
-        from pyproj import Transformer
         utm_zone = int((self.origin_lon + 180) / 6) + 1
         wgs84_to_utm = Transformer.from_crs(
             'EPSG:4326', f'EPSG:326{utm_zone}', always_xy=True
@@ -312,24 +327,26 @@ class GAMMSNav2Bridge:
         """Create GAMMS agent at start node."""
         print("\n[Agent] Creating agent...")
         
+        # Strategy expects 'neighbor_sensor_0' format for get_moves()
         self.ctx.sensor.create_sensor(
-            'neighbor_sensor',
+            'neighbor_sensor_0',
             gamms.sensor.SensorType.NEIGHBOR
         )
         
+        # Strategy expects 'agent_0' format for get_moves()
         self.ctx.agent.create_agent(
-            'robot',
-            start_node=self.start_node,
-            sensors=['neighbor_sensor'],
+            self.agent_name,
+            start_node_id=self.start_node,
+            sensors=['neighbor_sensor_0'],
             meta={'team': 0}
         )
         
-        self.agent = self.ctx.agent.get_agent('robot')
+        self.agent = self.ctx.agent.get_agent(self.agent_name)
         
         self.ctx.visual.set_agent_visual(
-            'robot',
+            self.agent_name,
             color=(0, 255, 0),
-            size=15
+            size=3
         )
         
         strategy.visited_nodes.add(self.start_node)
@@ -450,6 +467,7 @@ class GAMMSNav2Bridge:
             print(f"[TestNav] Progress: {100*(i+1)/steps:.0f}%", end='\r')
             
         print(f"[TestNav] ✓ Arrived at node {node_id}           ")
+        self.agent.prev_node_id = self.agent.current_node_id
         return True
             
     # =========================================================================
@@ -473,7 +491,7 @@ class GAMMSNav2Bridge:
             
             print(f"\n[Step {self.step}] At node {current_node}")
             
-            strategy.agent_strategy(state, 'robot', self.step)
+            strategy.agent_strategy(state, self.agent_name, self.step)
             next_node = state.get('action')
             
             if next_node is None or next_node == current_node:
@@ -548,28 +566,41 @@ def main():
                         help='Map origin latitude')
     parser.add_argument('--origin-lon', type=float, required=True,
                         help='Map origin longitude')
-    parser.add_argument('--namespace', default='j100_0004',
-                        help='Robot namespace (default: j100_0004)')
+    parser.add_argument('--namespace', default='',
+                        help='Robot namespace (default: empty)')
     parser.add_argument('--test-mode', action='store_true',
                         help='Test mode: run GAMMS only, simulate navigation')
     parser.add_argument('--start-node', type=int, default=None,
                         help='Override start node ID')
+    parser.add_argument('--list-nodes', action='store_true',
+                        help='List all node IDs and exit')
     args = parser.parse_args()
     
-    # Update globals if namespace changed
-    global ROBOT_NS, GPS_TOPIC, FROMLL_SERVICE, NAV2_ACTION
-    ROBOT_NS = args.namespace
-    GPS_TOPIC = f'/{ROBOT_NS}/gps/filtered'
-    FROMLL_SERVICE = f'/{ROBOT_NS}/fromLL'
-    NAV2_ACTION = f'/{ROBOT_NS}/follow_waypoints'
+    # Handle --list-nodes: just load graph and show nodes
+    if args.list_nodes:
+        print(f"\n[List] Loading {args.osm_file}...")
+        G = gamms.osm.graph_from_xml(
+            args.osm_file,
+            resolution=5.0,
+            bidirectional=True,
+            retain_all=False,
+            tolerance=8.25
+        )
+        print(f"[List] Found {len(G.nodes)} nodes:\n")
+        for node_id in sorted(G.nodes()):
+            data = G.nodes[node_id]
+            print(f"  {node_id}: ({data['x']:.1f}, {data['y']:.1f})")
+        return
     
+    bridge = None
     try:
         bridge = GAMMSNav2Bridge(
             osm_file=args.osm_file,
             origin_lat=args.origin_lat,
             origin_lon=args.origin_lon,
             test_mode=args.test_mode,
-            start_node=args.start_node
+            start_node=args.start_node,
+            namespace=args.namespace
         )
         bridge.initialize()
         bridge.run()
@@ -580,8 +611,10 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
-        bridge.shutdown()
+        if bridge:
+            bridge.shutdown()
 
 
 if __name__ == '__main__':
     main()
+
